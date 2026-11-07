@@ -14,6 +14,9 @@ on:
           - r2
           - synthetic
         default: r2
+  schedule:
+    # Day 2 of each month at 11:00 UTC. inputs is empty, so SEC1_MODE falls back to r2.
+    - cron: "0 11 2 * *"
 
 permissions:
   contents: read

@@ -2,7 +2,7 @@
 
 Branch `sec1/offsite-backup` from production commit `662c035`.
 
-- Do **not** enable the nightly cron until approval gate A6. The schedule block in `oi-production-offsite-backup.yml` stays commented out, and both production workflows stay `workflow_dispatch` only.
+- Nightly backup cron is enabled: `0 10 * * *` (10:00 UTC, 3:00 AM Arizona). Restore-test cron is `0 11 2 * *` (day 2 at 11:00 UTC). Both workflows still accept `workflow_dispatch`. A scheduled restore uses the same default as a dispatch with no inputs: the newest real R2 snapshot.
 - Do **not** run backup against any project other than `bekaxmatcvxqpjixwsqn`.
 - Do **not** set `SEC1_OFFLINE_TEST` on a production workflow. That switch exists for `scripts/offsite-backup/test-offline.sh` and refuses any database or storage URL that is not loopback.
 - Restore tests use a throwaway Postgres on `localhost`, `127.0.0.1`, or `::1`. `supabase.co` and every other host are refused before a connection is attempted. A `?host=` or `?hostaddr=` override is checked too, because libpq uses those instead of the URL host.
