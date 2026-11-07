@@ -57,7 +57,7 @@ Format details and the restore host rules are in `docs/ops/SEC1-OFFSITE-BACKUP.m
 
 Use `restore-test.sh`. It refuses every database host except `localhost`, `127.0.0.1`, `::1`, and a local unix socket. `supabase.co` and any other host, including a `?host=` or `?hostaddr=` override, are refused before `psql` runs.
 
-The throwaway server and the client tools (`psql`, `pg_dump`, `pg_restore`, `pg_dumpall`) must both be PostgreSQL 17. A pg_dump 17 archive sets `transaction_timeout`, which older servers reject. `install-pg17-client.sh` installs that client. The script refuses to restore unless the client and the server both report major version 17.
+The throwaway server is Supabase's Postgres 17 image (`supabase/postgres:17.11.0.018`), so hosted schemas, roles, and extensions already exist. The client tools (`psql`, `pg_dump`, `pg_restore`, `pg_dumpall`) must be PostgreSQL 17 as well. `install-pg17-client.sh` installs that client. The script refuses to restore unless the client and the server both report major version 17.
 
 With `SEC1_MODE` unset or empty, the script downloads the newest `snapshots/YYYY-MM-DD/` prefix. `SEC1_MODE=synthetic` is an explicit opt-in that builds a tiny local dump instead.
 

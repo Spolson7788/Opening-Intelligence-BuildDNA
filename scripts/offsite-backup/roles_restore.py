@@ -145,7 +145,14 @@ def _is_duplicate_create(stmt: str, stderr: str) -> bool:
 
 def _is_reserved_role(name: str) -> bool:
     lowered = name.lower()
-    return lowered in SUPABASE_RESERVED_ROLES or lowered.startswith("pg_")
+    # The Supabase image already creates these. Do not CREATE or ALTER them.
+    # Any future supabase_* / pgsodium_* role is treated the same way.
+    return (
+        lowered in SUPABASE_RESERVED_ROLES
+        or lowered.startswith("pg_")
+        or lowered.startswith("supabase_")
+        or lowered.startswith("pgsodium_")
+    )
 
 
 def strip_granted_by(stmt: str) -> tuple[str, bool]:
@@ -301,6 +308,19 @@ def self_test() -> int:
         "postgres",
     )
     check("reserved role alter is skipped", reserved_sql is None and reserved_reason == "reserved")
+    etl_sql, etl_reason = prepare_statement(
+        "ALTER ROLE supabase_etl_admin WITH LOGIN PASSWORD 'secret'",
+        "postgres",
+    )
+    check("supabase_ prefix is reserved even when not listed", etl_sql is None and etl_reason == "reserved")
+    image_boot_sql, image_boot_reason = prepare_statement(
+        "ALTER ROLE supabase_admin WITH SUPERUSER PASSWORD 'secret'",
+        "supabase_admin",
+    )
+    check(
+        "image superuser is left unchanged",
+        image_boot_sql is None and image_boot_reason == "bootstrap",
+    )
     boot_sql, boot_reason = prepare_statement(
         "ALTER ROLE postgres WITH SUPERUSER PASSWORD 'secret'",
         "postgres",

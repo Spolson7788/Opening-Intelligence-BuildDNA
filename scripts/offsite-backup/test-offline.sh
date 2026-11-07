@@ -133,7 +133,9 @@ problems = []
 def need(ok, message):
     if not ok:
         problems.append(message)
-need("image: postgres:17\n" in wf, "restore service image is not postgres:17")
+need("image: supabase/postgres:17.11.0.018\n" in wf, "restore service image is not supabase/postgres 17.11.0.018")
+need("image: postgres:17\n" not in wf, "restore workflow still uses plain postgres:17")
+need("supabase_admin:postgres@127.0.0.1:5432/postgres" in wf, "restore target is not the Supabase image database")
 need("postgres:16" not in wf, "restore workflow still mentions postgres 16")
 need("install-pg17-client.sh" in wf, "restore workflow does not install the PostgreSQL 17 client")
 need("postgresql-client " not in wf and "postgresql-client\n" not in wf, "restore workflow installs the distro client metapackage")
@@ -889,7 +891,8 @@ PY
   PGPASSWORD="$ROLE_SECRET" psql "postgresql://oi_pr2_api@127.0.0.1:5432/sec1_supa_dst" -v ON_ERROR_STOP=1 -tAc 'select 1' >/dev/null
   pg_restore -l "$work/gen/plain.dump" >"$work/again.list"
   psql "$dst" -v ON_ERROR_STOP=1 -tA -c "SELECT name FROM pg_available_extensions" >"$work/ext.txt"
-  python3 "$SCRIPT_DIR/restore_toc.py" "$work/again.list" "$work/ext.txt" >/dev/null
+  : >"$work/installed.txt"
+  python3 "$SCRIPT_DIR/restore_toc.py" "$work/again.list" "$work/ext.txt" "$work/installed.txt" >/dev/null
   set +e
   pg_restore --exit-on-error --single-transaction --no-owner --no-acl \
     --use-list="$work/again.list" --dbname="$dst" "$work/gen/plain.dump" >"$work/second.log" 2>&1
@@ -1004,6 +1007,156 @@ download_failure() {
 }
 fail_log="$(mktemp)"
 run_ok "injected download failure fails the run" download_failure "$fail_log"
+
+echo "STEP: full restore on supabase/postgres:17.11.0.018"
+hosted_image_restore() {
+  local docker_cmd src work baseline
+  if docker info >/dev/null 2>&1; then
+    docker_cmd=(docker)
+  elif sudo docker info >/dev/null 2>&1; then
+    docker_cmd=(sudo docker)
+  else
+    echo "docker is required to test the Supabase Postgres image" >&2
+    return 1
+  fi
+  "${docker_cmd[@]}" rm -f sec1-supabase sec1-supabase-restore >/dev/null 2>&1 || true
+  "${docker_cmd[@]}" run -d --name sec1-supabase-restore \
+    -p 127.0.0.1:5433:5432 \
+    -e POSTGRES_PASSWORD=postgres \
+    supabase/postgres:17.11.0.018 >/dev/null
+  local i ready=0
+  for i in $(seq 1 60); do
+    if PGPASSWORD=postgres psql "postgresql://supabase_admin@127.0.0.1:5433/postgres" -tAc 'select 1' >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  [[ "$ready" == "1" ]]
+  src="postgresql://supabase_admin:postgres@127.0.0.1:5433/postgres"
+  baseline="$(psql "$src" -v ON_ERROR_STOP=1 -tAc "SELECT (to_regclass('auth.users') IS NOT NULL AND EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'realtime'))::text")"
+  [[ "${baseline//[[:space:]]/}" == "t" || "${baseline//[[:space:]]/}" == "true" ]]
+  psql "$src" -v ON_ERROR_STOP=1 <<SQL
+CREATE SCHEMA oi_private;
+CREATE TABLE public.organizations (id integer PRIMARY KEY, name text NOT NULL);
+CREATE TABLE public.users (
+  id integer PRIMARY KEY,
+  organization_id integer NOT NULL REFERENCES public.organizations (id)
+);
+CREATE TABLE public.platform_staff (id integer PRIMARY KEY);
+CREATE TABLE oi_private.notes (id integer PRIMARY KEY, body text NOT NULL);
+INSERT INTO public.organizations VALUES (1, 'Acme');
+INSERT INTO public.users VALUES (1, 1);
+INSERT INTO public.platform_staff VALUES (7);
+INSERT INTO oi_private.notes VALUES (1, 'kept');
+ALTER PUBLICATION supabase_realtime ADD TABLES IN SCHEMA public;
+CREATE TABLE realtime.messages (
+  id integer PRIMARY KEY,
+  payload jsonb,
+  binary_payload bytea
+);
+ALTER TABLE realtime.messages ADD CONSTRAINT messages_payload_exclusive
+  CHECK (((payload IS NULL) OR (binary_payload IS NULL))) NOT VALID;
+CREATE FUNCTION auth.sec1_touch() RETURNS trigger LANGUAGE plpgsql AS \$func\$
+BEGIN RETURN NEW; END \$func\$;
+CREATE TRIGGER sec1_auth_users_guard BEFORE UPDATE ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION auth.sec1_touch();
+DROP ROLE IF EXISTS oi_pr2_api;
+CREATE ROLE oi_pr2_api LOGIN PASSWORD '${ROLE_SECRET}';
+GRANT oi_pr2_api TO postgres GRANTED BY supabase_admin;
+SQL
+  work="$(mktemp -d)"
+  mkdir -p "$work/gen" "$work/snap/db" "$work/snap/storage"
+  pg_dump --format=custom --no-owner --no-acl --dbname="$src" --file="$work/gen/plain.dump"
+  pg_dumpall --roles-only --dbname="$src" >"$work/gen/roles.sql"
+  chmod 600 "$work/gen/plain.dump" "$work/gen/roles.sql"
+  if ! grep -q "GRANTED BY supabase_admin" "$work/gen/roles.sql"; then
+    echo "roles dump is missing GRANTED BY supabase_admin" >&2
+    return 1
+  fi
+  BACKUP_ENCRYPTION_KEY="$ENC_KEY" python3 "$SCRIPT_DIR/crypto.py" encrypt \
+    "$work/gen/plain.dump" "$work/snap/db/oi-production.dump.enc"
+  BACKUP_ENCRYPTION_KEY="$ENC_KEY" python3 "$SCRIPT_DIR/crypto.py" encrypt \
+    "$work/gen/roles.sql" "$work/snap/db/oi-production.roles.sql.enc"
+  python3 - "$work" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+pairs = [
+    (root / "gen/plain.dump", root / "snap/db/oi-production.dump.plaintext.sha256", "plaintext-oi-production.dump"),
+    (root / "gen/roles.sql", root / "snap/db/oi-production.roles.sql.plaintext.sha256", "plaintext-oi-production.roles.sql"),
+    (root / "snap/db/oi-production.dump.enc", root / "snap/db/oi-production.dump.enc.sha256", "db/oi-production.dump.enc"),
+    (root / "snap/db/oi-production.roles.sql.enc", root / "snap/db/oi-production.roles.sql.enc.sha256", "db/oi-production.roles.sql.enc"),
+]
+for source, dest, label in pairs:
+    dest.write_text(f"{sha(source)}  {label}\n", encoding="utf-8")
+PY
+  echo fixture >"$work/snap/storage/fixture.txt"
+  python3 "$SCRIPT_DIR/manifest.py" write "$work/snap" >/dev/null
+  ensure_bucket oi-supabase-image
+  aws_cli s3 sync "$work/snap" "s3://oi-supabase-image/snapshots/2026-11-07" --only-show-errors
+  pg_restore -l "$work/gen/plain.dump" >"$work/toc.list"
+  psql "$src" -v ON_ERROR_STOP=1 -tA -c "SELECT name FROM pg_available_extensions" >"$work/available.txt"
+  psql "$src" -v ON_ERROR_STOP=1 -tA -c "SELECT extname FROM pg_extension" >"$work/installed.txt"
+  echo "---- TOC inventory (restored versus skipped) ----"
+  python3 "$SCRIPT_DIR/restore_toc.py" inventory "$work/toc.list" "$work/available.txt" "$work/installed.txt" | tee "$work/inventory.txt"
+  python3 - "$work/inventory.txt" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+restored, skipped = text.split("SKIPPED", 1)
+checks = {
+    "public table data restored": "TABLE DATA schema=public" in restored,
+    "app schema restored": "TABLE schema=oi_private" in restored,
+    "realtime check constraint skipped": "CHECK CONSTRAINT schema=realtime" in skipped and "CHECK CONSTRAINT schema=realtime" not in restored,
+    "auth trigger skipped": "TRIGGER schema=auth" in skipped and "TRIGGER schema=auth" not in restored,
+    "event triggers skipped": "EVENT TRIGGER schema=-" in skipped,
+    "supabase publication skipped": "PUBLICATION schema=-" in skipped,
+    "publication tables in public skipped": "PUBLICATION TABLES IN SCHEMA schema=public" in skipped,
+    "auth table data skipped": "TABLE DATA schema=auth" in skipped and "TABLE DATA schema=auth" not in restored,
+}
+failed = [name for name, ok in checks.items() if not ok]
+if failed:
+    raise SystemExit("TOC inventory mismatch: " + ", ".join(failed))
+PY
+  psql "$src" -v ON_ERROR_STOP=1 <<'SQL'
+ALTER TABLE realtime.messages DROP CONSTRAINT messages_payload_exclusive;
+DROP TRIGGER sec1_auth_users_guard ON auth.users;
+DROP TABLE public.users;
+DROP TABLE public.organizations;
+DROP TABLE public.platform_staff;
+DROP SCHEMA oi_private CASCADE;
+SQL
+  psql "$src" -v ON_ERROR_STOP=1 -c "REVOKE oi_pr2_api FROM postgres;"
+  psql "$src" -v ON_ERROR_STOP=1 -c "DROP ROLE oi_pr2_api;"
+  env SEC1_MODE=r2 \
+    SEC1_SNAPSHOT_PREFIX=snapshots/2026-11-07 \
+    SEC1_TARGET_DATABASE_URL="$src" \
+    BACKUP_ENCRYPTION_KEY="$ENC_KEY" \
+    R2_BUCKET=oi-supabase-image \
+    bash "$SCRIPT_DIR/restore-test.sh"
+  local org users staff notes auth_ok constraint trigger admin_super
+  org="$(psql "$src" -v ON_ERROR_STOP=1 -tAc 'select count(*) from public.organizations')"
+  users="$(psql "$src" -v ON_ERROR_STOP=1 -tAc 'select count(*) from public.users')"
+  staff="$(psql "$src" -v ON_ERROR_STOP=1 -tAc 'select count(*) from public.platform_staff')"
+  notes="$(psql "$src" -v ON_ERROR_STOP=1 -tAc 'select count(*) from oi_private.notes')"
+  auth_ok="$(psql "$src" -v ON_ERROR_STOP=1 -tAc "select to_regclass('auth.users') is not null")"
+  constraint="$(psql "$src" -v ON_ERROR_STOP=1 -tAc "select count(*) from pg_constraint where conname = 'messages_payload_exclusive'")"
+  trigger="$(psql "$src" -v ON_ERROR_STOP=1 -tAc "select count(*) from pg_trigger where tgname = 'sec1_auth_users_guard'")"
+  admin_super="$(psql "$src" -v ON_ERROR_STOP=1 -tAc "select rolsuper from pg_roles where rolname = 'supabase_admin'")"
+  [[ "${org//[[:space:]]/}" == "1" ]]
+  [[ "${users//[[:space:]]/}" == "1" ]]
+  [[ "${staff//[[:space:]]/}" == "1" ]]
+  [[ "${notes//[[:space:]]/}" == "1" ]]
+  [[ "${auth_ok//[[:space:]]/}" == "t" || "${auth_ok//[[:space:]]/}" == "true" ]]
+  [[ "${constraint//[[:space:]]/}" == "0" ]]
+  [[ "${trigger//[[:space:]]/}" == "0" ]]
+  [[ "${admin_super//[[:space:]]/}" == "t" || "${admin_super//[[:space:]]/}" == "true" ]]
+  PGPASSWORD="$ROLE_SECRET" psql "postgresql://oi_pr2_api@127.0.0.1:5433/postgres" -v ON_ERROR_STOP=1 -tAc 'select 1' >/dev/null
+  "${docker_cmd[@]}" rm -f sec1-supabase-restore >/dev/null 2>&1 || true
+  rm -rf "$work"
+}
+run_ok "hosted Supabase image restores app data and skips realtime, auth, and publications" hosted_image_restore
 
 echo
 echo "==== offline backup results: ${PASS_N} passed, ${FAIL_N} failed ===="

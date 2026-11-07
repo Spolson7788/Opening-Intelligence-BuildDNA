@@ -60,11 +60,11 @@ export SEC1_SNAPSHOT_PREFIX='snapshots/YYYY-MM-DD'   # optional
 bash scripts/offsite-backup/restore-test.sh
 ```
 
-The throwaway server and the `pg_restore` client must both be PostgreSQL 17. The workflow service image is `postgres:17`, and `install-pg17-client.sh` installs the matching client. A dispatch with no inputs uses that real snapshot. The script does not connect to the production database.
+The throwaway server is `supabase/postgres:17.11.0.018` and the `pg_restore` client is PostgreSQL 17. A dispatch with no inputs uses the newest real snapshot. The script does not connect to the production database.
 
-The script recreates `schema public`, restores roles, then `pg_restore --exit-on-error`. Supabase-reserved roles are created `NOLOGIN` and their hosted `ALTER` statements are not applied. `GRANTED BY` is removed. Application roles are restored. Hosted schemas such as `auth` and `storage`, and extensions this server does not provide, are omitted from the restore list. It checks that `organizations`, `users`, and `platform_staff` are present and logs their row counts. It does not change the throwaway server's bootstrap role (usually `postgres`), so the local password keeps working. Other application roles are created with their password hashes.
+The script recreates `schema public`, restores roles, then `pg_restore --exit-on-error`. Roles the image already has are left alone. `GRANTED BY` is removed. Application roles are restored. Hosted schemas (`auth`, `storage`, `realtime`, and the rest) and extensions already installed on the image are omitted from the restore list, including check constraints, triggers, publications, and event triggers. It checks that `organizations`, `users`, and `platform_staff` are present and logs their row counts. It does not change the image superuser. Other application roles are created with their password hashes.
 
-The throwaway server must already provide any extensions the dump creates. A missing extension fails the restore instead of being ignored.
+Extensions the image does not provide are left out of the restore list. An application object that still needs one of those extensions fails the restore.
 
 ## Offline CI
 
