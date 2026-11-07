@@ -114,6 +114,12 @@ echo "STEP: newest snapshot prefix"
 run_ok "newest dated snapshot prefix chosen and invalid names ignored" \
   python3 "$SCRIPT_DIR/snapshot_prefix.py" self-test
 
+echo "STEP: Supabase role and TOC filters"
+run_ok "GRANTED BY is stripped and reserved role statements are skipped" \
+  python3 "$SCRIPT_DIR/roles_restore.py" self-test
+run_ok "Supabase schemas and missing extensions are removed from the restore list" \
+  python3 "$SCRIPT_DIR/restore_toc.py" self-test
+
 echo "STEP: restore workflow pins Postgres 17 and a real R2 snapshot"
 workflow_pins_real_restore() {
   python3 - "$REPO_ROOT" <<'PY'
@@ -758,6 +764,150 @@ empty_snapshot_list_fails() {
   rm -f "$out"
 }
 run_ok "R2 restore with no dated snapshot fails closed" empty_snapshot_list_fails
+
+echo "STEP: Supabase-shaped roles and schemas"
+supabase_shaped_restore() {
+  local src dst work bad bad_rc count users staff auth storage crypto flags member anon_member second_rc
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 <<'SQL'
+DROP DATABASE IF EXISTS sec1_supa_src WITH (FORCE);
+DROP DATABASE IF EXISTS sec1_supa_dst WITH (FORCE);
+CREATE DATABASE sec1_supa_src;
+CREATE DATABASE sec1_supa_dst;
+SQL
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=0 -c "REVOKE oi_pr2_api FROM postgres;" >/dev/null 2>&1 || true
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP ROLE IF EXISTS oi_pr2_api;"
+  src="postgresql://postgres:postgres@127.0.0.1:5432/sec1_supa_src"
+  dst="postgresql://postgres:postgres@127.0.0.1:5432/sec1_supa_dst"
+  psql "$src" -v ON_ERROR_STOP=1 <<'SQL'
+CREATE SCHEMA auth;
+CREATE SCHEMA storage;
+CREATE SCHEMA extensions;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE TABLE public.organizations (id integer PRIMARY KEY, name text NOT NULL);
+CREATE TABLE public.users (
+  id integer PRIMARY KEY,
+  organization_id integer NOT NULL REFERENCES public.organizations (id)
+);
+CREATE TABLE public.platform_staff (id integer PRIMARY KEY);
+INSERT INTO public.organizations VALUES (1, 'Acme');
+INSERT INTO public.users VALUES (1, 1);
+INSERT INTO public.platform_staff VALUES (7);
+CREATE TABLE auth.users (id integer PRIMARY KEY, email text);
+CREATE TABLE storage.objects (id integer PRIMARY KEY);
+INSERT INTO auth.users VALUES (1, 'should-not-restore@example.com');
+INSERT INTO storage.objects VALUES (1);
+CREATE FUNCTION auth.uid() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+SQL
+  work="$(mktemp -d)"
+  mkdir -p "$work/gen" "$work/snap/db" "$work/snap/storage"
+  pg_dump --format=custom --no-owner --no-acl --dbname="$src" --file="$work/gen/plain.dump"
+  cat >"$work/gen/roles.sql" <<SQL
+SET default_transaction_read_only = off;
+CREATE ROLE supabase_admin;
+ALTER ROLE supabase_admin WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS PASSWORD '${ROLE_SECRET}';
+CREATE ROLE anon;
+ALTER ROLE anon WITH NOSUPERUSER NOLOGIN;
+CREATE ROLE authenticator;
+ALTER ROLE authenticator WITH LOGIN PASSWORD '${ROLE_SECRET}';
+CREATE ROLE supabase_read_only_user;
+ALTER ROLE supabase_read_only_user WITH LOGIN BYPASSRLS PASSWORD '${ROLE_SECRET}';
+CREATE ROLE oi_pr2_api;
+ALTER ROLE oi_pr2_api WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD '${ROLE_SECRET}';
+GRANT anon TO authenticator WITH INHERIT TRUE GRANTED BY supabase_admin;
+GRANT oi_pr2_api TO postgres WITH INHERIT TRUE GRANTED BY supabase_admin;
+GRANT pg_read_all_data TO supabase_read_only_user GRANTED BY supabase_admin;
+SQL
+  chmod 600 "$work/gen/roles.sql" "$work/gen/plain.dump"
+  BACKUP_ENCRYPTION_KEY="$ENC_KEY" python3 "$SCRIPT_DIR/crypto.py" encrypt \
+    "$work/gen/plain.dump" "$work/snap/db/oi-production.dump.enc"
+  BACKUP_ENCRYPTION_KEY="$ENC_KEY" python3 "$SCRIPT_DIR/crypto.py" encrypt \
+    "$work/gen/roles.sql" "$work/snap/db/oi-production.roles.sql.enc"
+  python3 - "$work" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+pairs = [
+    (root / "gen/plain.dump", root / "snap/db/oi-production.dump.plaintext.sha256", "plaintext-oi-production.dump"),
+    (root / "gen/roles.sql", root / "snap/db/oi-production.roles.sql.plaintext.sha256", "plaintext-oi-production.roles.sql"),
+    (root / "snap/db/oi-production.dump.enc", root / "snap/db/oi-production.dump.enc.sha256", "db/oi-production.dump.enc"),
+    (root / "snap/db/oi-production.roles.sql.enc", root / "snap/db/oi-production.roles.sql.enc.sha256", "db/oi-production.roles.sql.enc"),
+]
+for source, dest, label in pairs:
+    dest.write_text(f"{sha(source)}  {label}\n", encoding="utf-8")
+PY
+  echo fixture >"$work/snap/storage/fixture.txt"
+  python3 "$SCRIPT_DIR/manifest.py" write "$work/snap" >/dev/null
+  ensure_bucket oi-supabase-restore
+  aws_cli s3 sync "$work/snap" "s3://oi-supabase-restore/snapshots/2026-01-15" --only-show-errors
+  bad="$(mktemp)"
+  cat "$work/gen/roles.sql" >"$bad"
+  printf '\nGRANT no_such_app_role TO oi_pr2_api;\n' >>"$bad"
+  chmod 600 "$bad"
+  set +e
+  env SEC1_TARGET_DATABASE_URL="$dst" \
+    python3 "$SCRIPT_DIR/roles_restore.py" "$bad" >"$work/bad.log" 2>&1
+  bad_rc=$?
+  set -e
+  cat "$work/bad.log"
+  if [[ "$bad_rc" -eq 0 ]]; then
+    echo "bad app-role grant was accepted" >&2
+    return 1
+  fi
+  if ! grep -q "roles restore statement failed" "$work/bad.log"; then
+    echo "bad grant was not a hard failure" >&2
+    return 1
+  fi
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=0 -c "REVOKE oi_pr2_api FROM postgres;" >/dev/null 2>&1 || true
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP ROLE IF EXISTS oi_pr2_api;"
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS sec1_supa_dst WITH (FORCE);"
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE sec1_supa_dst;"
+  env SEC1_MODE=r2 \
+    SEC1_SNAPSHOT_PREFIX=snapshots/2026-01-15 \
+    SEC1_TARGET_DATABASE_URL="$dst" \
+    BACKUP_ENCRYPTION_KEY="$ENC_KEY" \
+    R2_BUCKET=oi-supabase-restore \
+    bash "$SCRIPT_DIR/restore-test.sh"
+  count="$(psql "$dst" -v ON_ERROR_STOP=1 -tAc 'select count(*) from public.organizations')"
+  users="$(psql "$dst" -v ON_ERROR_STOP=1 -tAc 'select count(*) from public.users')"
+  staff="$(psql "$dst" -v ON_ERROR_STOP=1 -tAc 'select count(*) from public.platform_staff')"
+  auth="$(psql "$dst" -v ON_ERROR_STOP=1 -tAc "select to_regclass('auth.users') is null")"
+  storage="$(psql "$dst" -v ON_ERROR_STOP=1 -tAc "select to_regclass('storage.objects') is null")"
+  crypto="$(psql "$dst" -v ON_ERROR_STOP=1 -tAc "select count(*) from pg_extension where extname = 'pgcrypto'")"
+  [[ "${count//[[:space:]]/}" == "1" ]]
+  [[ "${users//[[:space:]]/}" == "1" ]]
+  [[ "${staff//[[:space:]]/}" == "1" ]]
+  [[ "${auth//[[:space:]]/}" == "t" ]]
+  [[ "${storage//[[:space:]]/}" == "t" ]]
+  [[ "${crypto//[[:space:]]/}" == "1" ]]
+  flags="$(psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -tAc "select (not rolcanlogin and not rolsuper and not rolbypassrls) from pg_roles where rolname = 'supabase_admin'")"
+  [[ "${flags//[[:space:]]/}" == "t" ]]
+  member="$(psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -tAc "select count(*) from pg_auth_members am join pg_roles member on member.oid = am.member join pg_roles role on role.oid = am.roleid where member.rolname = 'postgres' and role.rolname = 'oi_pr2_api'")"
+  anon_member="$(psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -tAc "select count(*) from pg_auth_members am join pg_roles member on member.oid = am.member join pg_roles role on role.oid = am.roleid where member.rolname = 'authenticator' and role.rolname = 'anon'")"
+  [[ "${member//[[:space:]]/}" == "1" ]]
+  [[ "${anon_member//[[:space:]]/}" == "1" ]]
+  PGPASSWORD="$ROLE_SECRET" psql "postgresql://oi_pr2_api@127.0.0.1:5432/sec1_supa_dst" -v ON_ERROR_STOP=1 -tAc 'select 1' >/dev/null
+  pg_restore -l "$work/gen/plain.dump" >"$work/again.list"
+  psql "$dst" -v ON_ERROR_STOP=1 -tA -c "SELECT name FROM pg_available_extensions" >"$work/ext.txt"
+  python3 "$SCRIPT_DIR/restore_toc.py" "$work/again.list" "$work/ext.txt" >/dev/null
+  set +e
+  pg_restore --exit-on-error --single-transaction --no-owner --no-acl \
+    --use-list="$work/again.list" --dbname="$dst" "$work/gen/plain.dump" >"$work/second.log" 2>&1
+  second_rc=$?
+  set -e
+  if [[ "$second_rc" -eq 0 ]]; then
+    echo "repeating the filtered public restore was treated as success" >&2
+    return 1
+  fi
+  if ! grep -q "already exists" "$work/second.log"; then
+    echo "repeat restore failed for an unexpected reason" >&2
+    cat "$work/second.log" >&2
+    return 1
+  fi
+  rm -rf "$work"
+  rm -f "$bad"
+}
+run_ok "Supabase roles fixture restores app roles and public data, and still fails closed" supabase_shaped_restore
 
 echo "STEP: tampered ciphertext on the restore path"
 tamper_restore() {

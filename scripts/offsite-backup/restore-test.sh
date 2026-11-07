@@ -209,26 +209,21 @@ log "restoring roles into throwaway Postgres"
 python3 "$LIB_DIR/roles_restore.py" "$WORK/plain.roles.sql"
 
 log "restoring database into throwaway Postgres"
-# pg_dump omits CREATE SCHEMA public. Recreate it, and skip a TOC entry that
-# would create it again. Every other restore error still fails the run.
+# pg_dump omits CREATE SCHEMA public, and Supabase also emits it. Recreate
+# public, then drop TOC entries for that schema, for hosted schemas such as
+# auth and storage, and for extensions this server does not have. Entries
+# that remain are restored with --exit-on-error, so a public data error
+# still fails the run.
 psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
 DROP SCHEMA IF EXISTS public CASCADE;
 CREATE SCHEMA public;
 GRANT ALL ON SCHEMA public TO public;
 SQL
 pg_restore -l "$WORK/plain.dump" >"$WORK/restore.list"
-python3 - "$WORK/restore.list" <<'PY'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-out = []
-for line in path.read_text(encoding="utf-8").splitlines():
-    body = line[1:] if line.startswith(";") else line
-    if " SCHEMA - public " in f" {body} ":
-        if not line.startswith(";"):
-            line = ";" + line
-    out.append(line)
-path.write_text("\n".join(out) + "\n", encoding="utf-8")
-PY
+psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -tA \
+  -c "SELECT name FROM pg_available_extensions" \
+  >"$WORK/available-extensions.txt"
+python3 "$LIB_DIR/restore_toc.py" "$WORK/restore.list" "$WORK/available-extensions.txt"
 pg_restore --exit-on-error --single-transaction --no-owner --no-acl \
   --use-list="$WORK/restore.list" --dbname="$TARGET_DB_URL" "$WORK/plain.dump"
 
