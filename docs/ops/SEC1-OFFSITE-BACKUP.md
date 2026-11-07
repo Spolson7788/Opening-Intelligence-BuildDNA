@@ -54,13 +54,15 @@ Supported path (host guard included):
 
 ```bash
 export BACKUP_ENCRYPTION_KEY
-export SEC1_MODE=r2
 export SEC1_TARGET_DATABASE_URL='postgresql://postgres@127.0.0.1:5432/oi_restore_test'
+# Default is the newest snapshots/YYYY-MM-DD prefix. SEC1_MODE=synthetic is opt-in only.
 export SEC1_SNAPSHOT_PREFIX='snapshots/YYYY-MM-DD'   # optional
 bash scripts/offsite-backup/restore-test.sh
 ```
 
-The script recreates `schema public`, restores roles, then `pg_restore --exit-on-error`. It does not change the throwaway server's bootstrap role (usually `postgres`), so the local password keeps working. Other roles are created with their password hashes.
+The throwaway server and the `pg_restore` client must both be PostgreSQL 17. The workflow service image is `postgres:17`, and `install-pg17-client.sh` installs the matching client. A dispatch with no inputs uses that real snapshot. The script does not connect to the production database.
+
+The script recreates `schema public`, restores roles, then `pg_restore --exit-on-error`. It checks that `organizations`, `users`, and `platform_staff` are present and logs their row counts. It does not change the throwaway server's bootstrap role (usually `postgres`), so the local password keeps working. Other roles are created with their password hashes.
 
 The throwaway server must already provide any extensions the dump creates. A missing extension fails the restore instead of being ignored.
 

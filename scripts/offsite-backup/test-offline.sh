@@ -7,7 +7,10 @@ set -euo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PATH="${HOME}/.local/bin:${PATH}"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Client tools must be PostgreSQL 17 when that prefix exists. A missing
+# directory still fails the version check once Postgres is required.
+PATH="/usr/lib/postgresql/17/bin:${HOME}/.local/bin:${PATH}"
 export PATH
 
 PASS_N=0
@@ -107,6 +110,74 @@ echo "STEP: restore-target guard matrix"
 run_ok "local restore targets allowed and other hosts refused" \
   python3 "$SCRIPT_DIR/guards.py" self-test
 
+echo "STEP: newest snapshot prefix"
+run_ok "newest dated snapshot prefix chosen and invalid names ignored" \
+  python3 "$SCRIPT_DIR/snapshot_prefix.py" self-test
+
+echo "STEP: restore workflow pins Postgres 17 and a real R2 snapshot"
+workflow_pins_real_restore() {
+  python3 - "$REPO_ROOT" <<'PY'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+wf = (root / ".github/workflows/oi-production-backup-restore-test.yml").read_text(encoding="utf-8")
+offline = (root / ".github/workflows/oi-offsite-backup-offline-test.yml").read_text(encoding="utf-8")
+script = (root / "scripts/offsite-backup/restore-test.sh").read_text(encoding="utf-8")
+problems = []
+def need(ok, message):
+    if not ok:
+        problems.append(message)
+need("image: postgres:17\n" in wf, "restore service image is not postgres:17")
+need("postgres:16" not in wf, "restore workflow still mentions postgres 16")
+need("install-pg17-client.sh" in wf, "restore workflow does not install the PostgreSQL 17 client")
+need("postgresql-client " not in wf and "postgresql-client\n" not in wf, "restore workflow installs the distro client metapackage")
+need("default: r2\n" in wf, "workflow_dispatch default is not r2")
+need("- r2\n" in wf and "- synthetic\n" in wf, "r2 and synthetic choices must both stay")
+need("inputs.mode || 'r2'" in wf, "omitted workflow input does not fall back to r2")
+need("alert-failure.sh" in wf, "Resend failure alert was removed")
+need('BACKUP_ALERT_SUBJECT: "OI backup restore-test FAILED"' in wf, "restore failure alert subject changed")
+need("OI_PROD_DATABASE_URL" not in wf, "restore workflow still receives the production database URL")
+for name in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET", "BACKUP_ENCRYPTION_KEY"):
+    need(f"secrets.{name}" in wf, f"restore workflow is missing {name}")
+need('MODE="${SEC1_MODE:-r2}"' in script, "restore script default is not r2")
+need("OI_PROD_DATABASE_URL" not in script, "restore script still queries the production database")
+need("image: postgres:17\n" in offline, "offline test service image is not postgres:17")
+need("install-pg17-client.sh" in offline, "offline workflow does not install the PostgreSQL 17 client")
+backup = (root / ".github/workflows/oi-production-offsite-backup.yml").read_text(encoding="utf-8")
+need("install-pg17-client.sh" in backup, "backup workflow does not install the PostgreSQL 17 client")
+need("postgresql-client " not in backup and "postgresql-client\n" not in backup, "backup workflow installs the distro client metapackage")
+if problems:
+    sys.stderr.write("\n".join(problems) + "\n")
+    raise SystemExit(1)
+print("restore workflow pins Postgres 17 and defaults to the real snapshot")
+PY
+}
+run_ok "workflow defaults to the newest R2 snapshot on Postgres 17" workflow_pins_real_restore
+
+echo "STEP: R2 client settings match the backup bucket"
+r2_endpoint_shape() {
+  local out
+  out="$(
+    env -u R2_ENDPOINT -u R2_REGION \
+      R2_ACCOUNT_ID='acct.example' \
+      R2_ACCESS_KEY_ID='offline-access-key' \
+      R2_SECRET_ACCESS_KEY='offline-secret-key' \
+      R2_BUCKET='oi-production-backups' \
+      bash -c 'source "$1"; configure_r2_aws_cli; printf "endpoint=%s\nregion=%s\nbucket=%s\n" "$R2_ENDPOINT" "$AWS_DEFAULT_REGION" "$R2_BUCKET"; cat "$AWS_CONFIG_FILE"' \
+      _ "$SCRIPT_DIR/lib.sh"
+  )"
+  printf '%s\n' "$out"
+  grep -q 'endpoint=https://acct.example.r2.cloudflarestorage.com' <<<"$out"
+  grep -q 'region=auto' <<<"$out"
+  grep -q 'bucket=oi-production-backups' <<<"$out"
+  grep -q 'addressing_style = path' <<<"$out"
+  if grep -q 'offline-secret-key' <<<"$out"; then
+    echo "R2 config printed the secret access key" >&2
+    return 1
+  fi
+}
+run_ok "R2 endpoint is path-style, region auto, and derived from the account id" r2_endpoint_shape
+
 echo "STEP: production guard stays on unless the offline flag is set"
 prod_guard() {
   if env OI_PROD_DATABASE_URL='postgresql://postgres:postgres@127.0.0.1:5432/db' \
@@ -185,6 +256,105 @@ if ! pg_isready -h 127.0.0.1 -p 5432 -q; then
   exit 1
 fi
 psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -tAc 'select 1' >/dev/null
+server_num="$(psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -tAc 'SHOW server_version_num')"
+server_num="${server_num//[[:space:]]/}"
+client_major="$(pg_restore --version | sed -n 's/.*(PostgreSQL) \([0-9][0-9]*\)\..*/\1/p')"
+if [[ "$server_num" != 17* || "$client_major" != "17" ]]; then
+  echo "FAIL: restore tests need PostgreSQL 17 client and server (server=${server_num:-missing} client=${client_major:-missing})" >&2
+  exit 1
+fi
+
+echo "STEP: default restore is the real snapshot, not the synthetic fixture"
+mode_does_not_synthesize() {
+  local mode_assignment="$1"
+  local log rc
+  log="$(mktemp)"
+  set +e
+  # shellcheck disable=SC2086
+  env -u SEC1_SNAPSHOT_PREFIX \
+      -u R2_ACCESS_KEY_ID -u R2_SECRET_ACCESS_KEY -u R2_ACCOUNT_ID \
+      -u R2_BUCKET -u R2_ENDPOINT -u R2_REGION \
+      -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_DEFAULT_REGION \
+      -u AWS_CONFIG_FILE -u SEC1_AWS_CONFIG_FILE \
+      $mode_assignment \
+      SEC1_TARGET_DATABASE_URL="$ADMIN_URL" \
+      BACKUP_ENCRYPTION_KEY="$ENC_KEY" \
+      bash "$SCRIPT_DIR/restore-test.sh" >"$log" 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    echo "restore-test succeeded without R2 credentials" >&2
+    cat "$log" >&2
+    return 1
+  fi
+  if grep -q "synthetic mode" "$log"; then
+    echo "restore took the synthetic path" >&2
+    cat "$log" >&2
+    return 1
+  fi
+  if ! grep -q "missing required env/secret: R2_ACCESS_KEY_ID" "$log"; then
+    echo "restore did not fail closed on the missing R2 credential" >&2
+    cat "$log" >&2
+    return 1
+  fi
+  scan_log "$log"
+}
+run_ok "omitted SEC1_MODE restores from R2 and fails closed without credentials" \
+  mode_does_not_synthesize "-u SEC1_MODE"
+run_ok "empty SEC1_MODE restores from R2 and fails closed without credentials" \
+  mode_does_not_synthesize "SEC1_MODE="
+
+unknown_mode_fails() {
+  local log rc
+  log="$(mktemp)"
+  set +e
+  env -u R2_ACCESS_KEY_ID \
+    SEC1_MODE=bogus \
+    SEC1_TARGET_DATABASE_URL="$ADMIN_URL" \
+    BACKUP_ENCRYPTION_KEY="$ENC_KEY" \
+    bash "$SCRIPT_DIR/restore-test.sh" >"$log" 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    echo "unknown mode succeeded" >&2
+    return 1
+  fi
+  if grep -q "synthetic mode" "$log"; then
+    echo "unknown mode fell through to synthetic" >&2
+    return 1
+  fi
+  grep -q "unknown SEC1_MODE: bogus" "$log"
+  scan_log "$log"
+}
+run_ok "unknown restore mode fails closed" unknown_mode_fails
+
+echo "STEP: pg_dump 17 transaction_timeout restores on Postgres 17"
+pg17_transaction_timeout() {
+  local url dump sql count
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS sec1_tx WITH (FORCE);"
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE sec1_tx;"
+  url="postgresql://postgres:postgres@127.0.0.1:5432/sec1_tx"
+  psql "$url" -v ON_ERROR_STOP=1 <<'SQL'
+CREATE TABLE public.sec1_tx (id integer PRIMARY KEY);
+INSERT INTO public.sec1_tx VALUES (1);
+SQL
+  dump="$(mktemp)"
+  pg_dump --format=custom --no-owner --no-acl --dbname="$url" --file="$dump"
+  sql="$(pg_restore -f - "$dump")"
+  grep -q 'SET transaction_timeout = 0;' <<<"$sql"
+  psql "$url" -v ON_ERROR_STOP=1 <<'SQL'
+DROP SCHEMA IF EXISTS public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO public;
+SQL
+  pg_restore --exit-on-error --single-transaction --no-owner --no-acl --dbname="$url" "$dump"
+  count="$(psql "$url" -v ON_ERROR_STOP=1 -tAc 'SELECT count(*) FROM public.sec1_tx')"
+  count="${count//[[:space:]]/}"
+  [[ "$count" == "1" ]]
+  rm -f "$dump"
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS sec1_tx WITH (FORCE);"
+}
+run_ok "pg_dump 17 transaction_timeout restores into Postgres 17" pg17_transaction_timeout
 
 if ! curl -sf "${S3_ENDPOINT}/minio/health/live" >/dev/null; then
   MINIO_BIN="${MINIO_BIN:-}"
@@ -526,6 +696,68 @@ PY
   rm -rf "$work"
 }
 run_ok "full backup, encrypt, upload, download, decrypt, checksum, restore, and row count" full_flow
+
+echo "STEP: default R2 restore picks the newest dated snapshot"
+restore_newest_daily() {
+  local out note count
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 <<'SQL'
+DROP DATABASE IF EXISTS sec1_dst WITH (FORCE);
+CREATE DATABASE sec1_dst;
+SQL
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP ROLE IF EXISTS sec1_writer;"
+  psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP ROLE IF EXISTS sec1_reader;"
+  out="$(mktemp)"
+  env -u SEC1_SNAPSHOT_PREFIX \
+    SEC1_OFFLINE_TEST=1 \
+    SEC1_MODE=r2 \
+    SEC1_TARGET_DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5432/sec1_dst" \
+    SEC1_EXPECT_TABLE=public.sec1_items \
+    SEC1_EXPECT_COUNT=4 \
+    BACKUP_ENCRYPTION_KEY="$ENC_KEY" \
+    R2_BUCKET=oi-backup-flow \
+    bash "$SCRIPT_DIR/restore-test.sh" >"$out" 2>&1
+  cat "$out"
+  grep -q "downloading snapshots/${SEC1_DATE_STAMP}" "$out"
+  grep -q "restore-test PASS mode=r2 snapshot=snapshots/${SEC1_DATE_STAMP}" "$out"
+  note="$(psql "postgresql://postgres:postgres@127.0.0.1:5432/sec1_dst" -v ON_ERROR_STOP=1 -tAc "select note from public.sec1_items where id=1")"
+  note="${note//[[:space:]]/}"
+  [[ "$note" == "row-one" ]]
+  count="$(psql "postgresql://postgres:postgres@127.0.0.1:5432/sec1_dst" -v ON_ERROR_STOP=1 -tAc "select count(*) from public.sec1_items")"
+  count="${count//[[:space:]]/}"
+  [[ "$count" == "4" ]]
+  rm -f "$out"
+}
+run_ok "omitted snapshot prefix restores the newest dated snapshot" restore_newest_daily
+
+empty_snapshot_list_fails() {
+  local out rc
+  ensure_bucket oi-restore-empty
+  out="$(mktemp)"
+  set +e
+  env -u SEC1_SNAPSHOT_PREFIX \
+    SEC1_MODE=r2 \
+    SEC1_TARGET_DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5432/sec1_dst" \
+    BACKUP_ENCRYPTION_KEY="$ENC_KEY" \
+    R2_BUCKET=oi-restore-empty \
+    bash "$SCRIPT_DIR/restore-test.sh" >"$out" 2>&1
+  rc=$?
+  set -e
+  cat "$out"
+  if [[ "$rc" -eq 0 ]]; then
+    echo "empty snapshot list restored" >&2
+    return 1
+  fi
+  if grep -q "synthetic mode" "$out"; then
+    echo "empty snapshot list fell through to synthetic" >&2
+    return 1
+  fi
+  if ! grep -Eq "no dated snapshots found in the backup bucket|cannot list snapshots" "$out"; then
+    echo "empty snapshot list did not fail closed" >&2
+    return 1
+  fi
+  rm -f "$out"
+}
+run_ok "R2 restore with no dated snapshot fails closed" empty_snapshot_list_fails
 
 echo "STEP: tampered ciphertext on the restore path"
 tamper_restore() {
