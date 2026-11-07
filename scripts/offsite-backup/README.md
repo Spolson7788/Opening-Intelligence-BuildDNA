@@ -69,7 +69,9 @@ export SEC1_SNAPSHOT_PREFIX=snapshots/YYYY-MM-DD   # optional; default is the ne
 bash scripts/offsite-backup/restore-test.sh
 ```
 
-The throwaway server's own bootstrap role (usually `postgres`) is left unchanged so the local connection keeps working. Every other role, membership GRANT, and password hash is restored. The roles SQL is never printed.
+The throwaway server's own bootstrap role (usually `postgres`) is left unchanged so the local connection keeps working. Supabase-reserved roles are created `NOLOGIN` with safe defaults and their `CREATE`/`ALTER` statements are not applied. `GRANTED BY` is removed so membership grants do not have to run as `supabase_admin`. Application roles such as `oi_pr2_api`, including password hashes, are restored. The roles SQL is never printed.
+
+Hosted schemas (`auth`, `storage`, and the other Supabase platform schemas) and extensions that are not installed on the throwaway server are left out of the restore list. `public` data is restored with `--exit-on-error`. After a real snapshot, `organizations`, `users`, and `platform_staff` must be present.
 
 ## Workflows
 

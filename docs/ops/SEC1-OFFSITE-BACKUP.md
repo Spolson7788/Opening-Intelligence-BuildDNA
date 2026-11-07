@@ -62,7 +62,7 @@ bash scripts/offsite-backup/restore-test.sh
 
 The throwaway server and the `pg_restore` client must both be PostgreSQL 17. The workflow service image is `postgres:17`, and `install-pg17-client.sh` installs the matching client. A dispatch with no inputs uses that real snapshot. The script does not connect to the production database.
 
-The script recreates `schema public`, restores roles, then `pg_restore --exit-on-error`. It checks that `organizations`, `users`, and `platform_staff` are present and logs their row counts. It does not change the throwaway server's bootstrap role (usually `postgres`), so the local password keeps working. Other roles are created with their password hashes.
+The script recreates `schema public`, restores roles, then `pg_restore --exit-on-error`. Supabase-reserved roles are created `NOLOGIN` and their hosted `ALTER` statements are not applied. `GRANTED BY` is removed. Application roles are restored. Hosted schemas such as `auth` and `storage`, and extensions this server does not provide, are omitted from the restore list. It checks that `organizations`, `users`, and `platform_staff` are present and logs their row counts. It does not change the throwaway server's bootstrap role (usually `postgres`), so the local password keeps working. Other application roles are created with their password hashes.
 
 The throwaway server must already provide any extensions the dump creates. A missing extension fails the restore instead of being ignored.
 
