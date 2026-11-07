@@ -1,5 +1,6 @@
-# SEC-1: Restore the newest oi-production R2 snapshot into throwaway Postgres 17.
+# SEC-1: Restore the newest oi-production R2 snapshot into throwaway Supabase Postgres 17.
 # Never production or staging. Synthetic mode is an explicit opt-in only.
+# Image 17.11.0.018 is the current supabase/postgres 17 release (PostgreSQL 17.11).
 name: OI production backup restore test
 
 on:
@@ -23,18 +24,16 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: postgres:17
+        image: supabase/postgres:17.11.0.018
         env:
-          POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: oi_restore_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U supabase_admin -h 127.0.0.1"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 40
     steps:
       - uses: actions/checkout@v4
 
@@ -45,21 +44,24 @@ jobs:
           python3 -m pip install --user --break-system-packages 'awscli==1.36.40'
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Wait for Postgres 17
+      - name: Wait for Supabase Postgres 17
         run: |
           export PATH="/usr/lib/postgresql/17/bin:${PATH}"
-          for i in $(seq 1 30); do
-            if pg_isready -h localhost -p 5432 -U postgres; then
+          url="postgresql://supabase_admin:postgres@127.0.0.1:5432/postgres"
+          for i in $(seq 1 60); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U supabase_admin; then
               break
             fi
-            if [[ "$i" -eq 30 ]]; then
+            if [[ "$i" -eq 60 ]]; then
               exit 1
             fi
-            sleep 1
+            sleep 2
           done
-          version="$(psql "postgresql://postgres:postgres@localhost:5432/oi_restore_test" -v ON_ERROR_STOP=1 -tAc 'SHOW server_version_num')"
+          version="$(psql "$url" -v ON_ERROR_STOP=1 -tAc 'SHOW server_version_num')"
           version="${version//[[:space:]]/}"
           [[ "$version" =~ ^17[0-9]{4}$ ]]
+          ready="$(psql "$url" -v ON_ERROR_STOP=1 -tAc "SELECT (to_regclass('auth.users') IS NOT NULL AND EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'realtime'))::text")"
+          [[ "${ready//[[:space:]]/}" == "true" || "${ready//[[:space:]]/}" == "t" ]]
           pg_restore --version | grep -q '(PostgreSQL) 17\.'
           pg_dump --version | grep -q '(PostgreSQL) 17\.'
 
@@ -67,7 +69,7 @@ jobs:
         env:
           # An omitted workflow_dispatch input is the newest real snapshot.
           SEC1_MODE: ${{ inputs.mode || 'r2' }}
-          SEC1_TARGET_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/oi_restore_test
+          SEC1_TARGET_DATABASE_URL: postgresql://supabase_admin:postgres@127.0.0.1:5432/postgres
           BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

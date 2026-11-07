@@ -223,7 +223,11 @@ pg_restore -l "$WORK/plain.dump" >"$WORK/restore.list"
 psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -tA \
   -c "SELECT name FROM pg_available_extensions" \
   >"$WORK/available-extensions.txt"
-python3 "$LIB_DIR/restore_toc.py" "$WORK/restore.list" "$WORK/available-extensions.txt"
+psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -tA \
+  -c "SELECT extname FROM pg_extension" \
+  >"$WORK/installed-extensions.txt"
+python3 "$LIB_DIR/restore_toc.py" "$WORK/restore.list" \
+  "$WORK/available-extensions.txt" "$WORK/installed-extensions.txt"
 pg_restore --exit-on-error --single-transaction --no-owner --no-acl \
   --use-list="$WORK/restore.list" --dbname="$TARGET_DB_URL" "$WORK/plain.dump"
 

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Filter a pg_restore TOC for a plain Postgres 17.
+"""Filter a pg_restore TOC for a throwaway Supabase Postgres 17.
 
-Supabase-managed schemas (auth, storage, and the rest of the hosted
-platform) are commented out. Extensions that are not installed on this
-server are commented out. public data, constraints, and app schemas stay
-in the list. pg_restore is still run with --exit-on-error, so a failure
-in an entry that remains is a hard failure.
+Every object in a Supabase-managed schema is commented out, including
+CHECK CONSTRAINT, triggers, policies, and publications that hang off
+those schemas. Extensions that are already installed, or not available
+on this server, are commented out too. Application schemas (public and
+any schema that is not part of the hosted platform) stay in the list.
+pg_restore is still run with --exit-on-error, so a failure in an entry
+that remains is a hard failure.
 
-Usage: restore_toc.py LISTFILE EXTENSIONS.txt
-  EXTENSIONS.txt is one available extension name per line.
+Usage: restore_toc.py LISTFILE AVAILABLE.txt INSTALLED.txt
+  AVAILABLE.txt and INSTALLED.txt are one extension name per line.
   LISTFILE is rewritten in place.
+  restore_toc.py inventory LISTFILE AVAILABLE.txt INSTALLED.txt
+  prints restored versus skipped description/schema pairs.
 """
 
 from __future__ import annotations
@@ -19,14 +23,16 @@ import sys
 from pathlib import Path
 
 # Schemas owned by the Supabase platform, not by the application.
-# `extensions` is kept so available extensions can be created there.
 # `public` and application schemas such as oi_private are kept.
+# `extensions` is hosted too: the image already creates it, and
+# CREATE SCHEMA extensions fails with "already exists" there.
 MANAGED_SCHEMAS = frozenset(
     {
         "_analytics",
         "_realtime",
         "auth",
         "cron",
+        "extensions",
         "graphql",
         "graphql_public",
         "net",
@@ -42,6 +48,11 @@ MANAGED_SCHEMAS = frozenset(
         "vault",
     }
 )
+_MANAGED_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    + "|".join(sorted(MANAGED_SCHEMAS, key=len, reverse=True))
+    + r")(?![A-Za-z0-9_])"
+)
 
 # Longest match first so "TABLE DATA" wins over "TABLE".
 _DESCRIPTIONS = tuple(
@@ -50,7 +61,12 @@ _DESCRIPTIONS = tuple(
             "ACCESS METHOD",
             "ACL",
             "AGGREGATE",
+            "ACL LANGUAGE",
+            "BLOB",
+            "BLOB COMMENTS",
+            "BLOB METADATA",
             "CAST",
+            "CHECK CONSTRAINT",
             "COLLATION",
             "COMMENT",
             "CONSTRAINT",
@@ -62,6 +78,7 @@ _DESCRIPTIONS = tuple(
             "EXTENSION",
             "FK CONSTRAINT",
             "FOREIGN DATA WRAPPER",
+            "FOREIGN SERVER",
             "FOREIGN TABLE",
             "FUNCTION",
             "INDEX",
@@ -77,17 +94,21 @@ _DESCRIPTIONS = tuple(
             "PROCEDURAL LANGUAGE",
             "PUBLICATION",
             "PUBLICATION TABLE",
+            "PUBLICATION TABLES IN SCHEMA",
             "ROW SECURITY",
             "RULE",
             "SCHEMA",
             "SEQUENCE",
             "SEQUENCE OWNED BY",
+            "SECURITY LABEL",
             "SEQUENCE SET",
             "SERVER",
             "SHELL TYPE",
             "STATISTICS",
             "SUBSCRIPTION",
+            "SUBSCRIPTION TABLE",
             "TABLE",
+            "TABLE ATTACH",
             "TABLE DATA",
             "TEXT SEARCH CONFIGURATION",
             "TEXT SEARCH DICTIONARY",
@@ -160,7 +181,18 @@ def _parse_entry(payload: str) -> tuple[str, str, str, str] | None:
     return None
 
 
-def _skip(desc: str, namespace: str, tag: str, owner: str, available: set[str]) -> str | None:
+def _publication_name(tag: str) -> str:
+    return tag.split(" ", 1)[0] if tag else ""
+
+
+def _skip(
+    desc: str,
+    namespace: str,
+    tag: str,
+    owner: str,
+    available: set[str],
+    installed: set[str],
+) -> str | None:
     if namespace in MANAGED_SCHEMAS:
         return "schema"
     if desc == "SCHEMA" and tag in MANAGED_SCHEMAS:
@@ -169,7 +201,9 @@ def _skip(desc: str, namespace: str, tag: str, owner: str, available: set[str]) 
     if desc == "SCHEMA" and tag == "public":
         return "public-schema"
     if desc == "EXTENSION":
-        if tag not in available:
+        # The image already installed the hosted extensions. Creating them
+        # again fails, and an extension that is not shipped cannot be created.
+        if tag in installed or tag not in available:
             return "extension"
         return None
     if desc == "COMMENT":
@@ -179,27 +213,38 @@ def _skip(desc: str, namespace: str, tag: str, owner: str, available: set[str]) 
                 return "comment"
         if tag.startswith("EXTENSION "):
             name = tag.split(" ", 1)[1].strip()
-            if name not in available:
+            if name in installed or name not in available:
                 return "extension"
         return None
     if desc == "EVENT TRIGGER":
         if owner.lower() in _RESERVED_OWNERS or tag in _SUPABASE_EVENT_TRIGGERS:
             return "event-trigger"
         return None
-    if desc in {"PUBLICATION", "PUBLICATION TABLE"}:
-        name = tag.split(" ", 1)[0] if tag else ""
+    if desc in {"PUBLICATION", "PUBLICATION TABLE", "PUBLICATION TABLES IN SCHEMA"}:
+        name = _publication_name(tag)
         if name == "supabase_realtime" or name.startswith("supabase_"):
             return "publication"
         return None
     return None
 
 
-def filter_lines(lines: list[str], available: set[str]) -> tuple[list[str], dict[str, object]]:
+def _mentions_managed(payload: str) -> bool:
+    return _MANAGED_TOKEN.search(payload) is not None
+
+
+def filter_lines(
+    lines: list[str],
+    available: set[str],
+    installed: set[str] | None = None,
+) -> tuple[list[str], dict[str, object]]:
     entry = re.compile(r"^(\d+);\s+(\d+)\s+(\d+)\s+(.*)$")
+    installed = installed or set()
     out: list[str] = []
     kept = 0
     skipped = 0
     skipped_extensions: set[str] = set()
+    restored: list[tuple[str, str]] = []
+    omitted: list[tuple[str, str]] = []
     for raw in lines:
         text = raw[:-1] if raw.endswith("\n") else raw
         # Header comments and blank lines stay comments. A trailing space on a
@@ -212,27 +257,62 @@ def filter_lines(lines: list[str], available: set[str]) -> tuple[list[str], dict
             out.append(text + "\n")
             kept += 1
             continue
-        parsed = _parse_entry(match.group(4))
+        payload = match.group(4)
+        parsed = _parse_entry(payload)
         if parsed is None:
+            if _mentions_managed(payload):
+                out.append(";" + text + "\n")
+                skipped += 1
+                omitted.append(("UNPARSED", "managed"))
+                continue
             out.append(text + "\n")
             kept += 1
+            restored.append(("UNPARSED", "-"))
             continue
         desc, namespace, tag, owner = parsed
-        reason = _skip(desc, namespace, tag, owner, available)
+        reason = _skip(desc, namespace, tag, owner, available, installed)
         if reason is None:
             out.append(text + "\n")
             kept += 1
+            restored.append((desc, namespace))
             continue
         out.append(";" + text + "\n")
         skipped += 1
+        omitted.append((desc, namespace if namespace else "-"))
         if reason == "extension" and desc == "EXTENSION" and tag:
             skipped_extensions.add(tag)
-    return out, {"kept": kept, "skipped": skipped, "extensions": skipped_extensions}
+    return out, {
+        "kept": kept,
+        "skipped": skipped,
+        "extensions": skipped_extensions,
+        "restored": restored,
+        "skipped_entries": omitted,
+    }
 
 
-def filter_text(text: str, available: set[str]) -> tuple[str, dict[str, object]]:
-    lines, info = filter_lines(text.splitlines(), available)
+def filter_text(
+    text: str,
+    available: set[str],
+    installed: set[str] | None = None,
+) -> tuple[str, dict[str, object]]:
+    lines, info = filter_lines(text.splitlines(), available, installed)
     return "".join(lines), info
+
+
+def format_inventory(info: dict[str, object]) -> str:
+    def lines_for(key: str, title: str) -> list[str]:
+        pairs = info.get(key, [])
+        counts: dict[tuple[str, str], int] = {}
+        for desc, namespace in pairs:  # type: ignore[union-attr]
+            counts[(desc, namespace)] = counts.get((desc, namespace), 0) + 1
+        body = [title]
+        for (desc, namespace), count in sorted(counts.items()):
+            body.append(f"  {desc} schema={namespace} count={count}")
+        if len(body) == 1:
+            body.append("  (none)")
+        return body
+
+    return "\n".join(lines_for("restored", "RESTORED") + [""] + lines_for("skipped_entries", "SKIPPED"))
 
 
 def self_test() -> int:
@@ -260,6 +340,9 @@ def self_test() -> int:
             "18; 6104 8 PUBLICATION - app_pub postgres",
             "19; 1259 9 TABLE storage objects postgres",
             "20; 1259 10 TABLE oi_private secrets postgres",
+            "21; 2606 11 CHECK CONSTRAINT realtime messages messages_payload_exclusive postgres",
+            "22; 6237 12 PUBLICATION TABLES IN SCHEMA public supabase_realtime public postgres",
+            "23; 2620 13 TRIGGER auth users on_auth_user_created postgres",
         ]
     )
     filtered, info = filter_text(sample, {"pgcrypto", "uuid-ossp"})
@@ -280,7 +363,7 @@ def self_test() -> int:
         return False
 
     need("auth schema skipped", not kept("SCHEMA - auth "))
-    need("extensions schema kept", kept("SCHEMA - extensions "))
+    need("extensions schema skipped", not kept("SCHEMA - extensions "))
     need("public schema skipped", not kept("SCHEMA - public "))
     need("pgcrypto kept", kept("EXTENSION - pgcrypto"))
     need("supabase_vault skipped", not kept("EXTENSION - supabase_vault"))
@@ -299,34 +382,61 @@ def self_test() -> int:
     need("app publication kept", kept("PUBLICATION - app_pub"))
     need("storage table skipped", not kept("TABLE storage objects"))
     need("app schema kept", kept("TABLE oi_private secrets"))
+    need("realtime check constraint skipped", not kept("CHECK CONSTRAINT realtime"))
+    need("realtime publication membership skipped", not kept("PUBLICATION TABLES IN SCHEMA"))
+    need("auth trigger skipped", not kept("TRIGGER auth users"))
     exts = info["extensions"]
     need("skipped extension recorded", exts == {"supabase_vault"})
-    # A line we do not understand must stay active so the restore fails closed.
+    # A line we do not understand must stay active so the restore fails closed,
+    # unless it names a hosted schema.
     unknown = "99; 1 2 NOT A REAL DESC public organizations postgres\n"
     unknown_out, _ = filter_text(unknown, set())
-    need("unrecognized TOC entry is kept", unknown_out.startswith("99;"))
+    need("unrecognized public TOC entry is kept", unknown_out.startswith("99;"))
+    hosted = "98; 1 2 NOT A REAL DESC realtime messages postgres\n"
+    hosted_out, _ = filter_text(hosted, set())
+    need("unrecognized hosted TOC entry is skipped", hosted_out.startswith(";98;"))
+    installed_out, installed_info = filter_text(
+        "2; 3079 16530 EXTENSION - pgcrypto \n",
+        {"pgcrypto"},
+        {"pgcrypto"},
+    )
+    need("already installed extension is skipped", installed_out.startswith(";"))
+    need(
+        "installed extension is recorded",
+        installed_info["extensions"] == {"pgcrypto"},
+    )
     return 1 if failures else 0
+
+
+def _read_names(path: Path) -> set[str]:
+    return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
 
 
 def main(argv: list[str]) -> int:
     if len(argv) == 2 and argv[1] == "self-test":
         return self_test()
-    if len(argv) != 3:
-        sys.stderr.write("usage: restore_toc.py LISTFILE EXTENSIONS.txt\n")
+    inventory = False
+    args = argv[1:]
+    if args and args[0] == "inventory":
+        inventory = True
+        args = args[1:]
+    if len(args) != 3:
+        sys.stderr.write(
+            "usage: restore_toc.py [inventory] LISTFILE AVAILABLE.txt INSTALLED.txt\n"
+        )
         return 2
-    list_path = Path(argv[1])
-    ext_path = Path(argv[2])
+    list_path = Path(args[0])
     try:
         original = list_path.read_text(encoding="utf-8")
-        available = {
-            line.strip()
-            for line in ext_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        }
+        available = _read_names(Path(args[1]))
+        installed = _read_names(Path(args[2]))
     except OSError:
         sys.stderr.write("ERROR: could not read restore TOC\n")
         return 1
-    filtered, info = filter_text(original, available)
+    filtered, info = filter_text(original, available, installed)
+    if inventory:
+        sys.stdout.write(format_inventory(info) + "\n")
+        return 0
     list_path.write_text(filtered, encoding="utf-8")
     names = ",".join(sorted(info["extensions"]))  # type: ignore[arg-type]
     print(
@@ -334,6 +444,7 @@ def main(argv: list[str]) -> int:
         f"skipped_extensions={names}",
         flush=True,
     )
+    print(format_inventory(info), flush=True)
     return 0
 
 
