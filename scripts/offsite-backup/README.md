@@ -75,8 +75,8 @@ Hosted schemas (`auth`, `storage`, and the other Supabase platform schemas) and 
 
 ## Workflows
 
-- `oi-production-offsite-backup.yml` — `workflow_dispatch` only (cron commented out).
-- `oi-production-backup-restore-test.yml` — `workflow_dispatch`. The default, including a dispatch with no inputs, restores the newest `snapshots/YYYY-MM-DD/` object from R2 into Postgres 17. `synthetic` is an explicit input only.
+- `oi-production-offsite-backup.yml` — `workflow_dispatch`, plus nightly `cron: "0 10 * * *"` (10:00 UTC, 3:00 AM Arizona).
+- `oi-production-backup-restore-test.yml` — `workflow_dispatch`, plus monthly `cron: "0 11 2 * *"` (day 2 at 11:00 UTC). A scheduled run has no inputs, so it restores the newest real R2 snapshot. `synthetic` is an explicit dispatch input only.
 - `oi-offsite-backup-offline-test.yml` — push to `sec1/offsite-backup` and `workflow_dispatch`. No secrets and no cron. Runs `test-offline.sh`.
 
 ## Offline test

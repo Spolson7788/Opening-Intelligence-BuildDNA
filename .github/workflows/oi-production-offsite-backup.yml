@@ -1,5 +1,5 @@
 # SEC-1: Off-site backup of oi-production → Cloudflare R2.
-# Manual only for now. Nightly cron is commented out until Stephan approves A6.
+# Nightly at 10:00 UTC (3:00 AM Arizona, MST UTC-7, no DST). workflow_dispatch remains.
 name: OI production offsite backup
 
 on:
@@ -9,9 +9,9 @@ on:
         description: "Also write monthly/ copy"
         type: boolean
         default: false
-  # schedule:
-  #   # 02:15 America/Phoenix ≈ 09:15 UTC (MST, UTC-7). Revisit around DST.
-  #   - cron: "15 9 * * *"
+  schedule:
+    # 10:00 UTC = 3:00 AM Arizona (MST, UTC-7, no daylight saving).
+    - cron: "0 10 * * *"
 
 permissions:
   contents: read

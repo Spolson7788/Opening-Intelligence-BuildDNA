@@ -142,6 +142,8 @@ need("postgresql-client " not in wf and "postgresql-client\n" not in wf, "restor
 need("default: r2\n" in wf, "workflow_dispatch default is not r2")
 need("- r2\n" in wf and "- synthetic\n" in wf, "r2 and synthetic choices must both stay")
 need("inputs.mode || 'r2'" in wf, "omitted workflow input does not fall back to r2")
+need('cron: "0 11 2 * *"\n' in wf, "restore schedule is not day 2 at 11:00 UTC")
+need("workflow_dispatch:" in wf, "restore workflow_dispatch was removed")
 need("alert-failure.sh" in wf, "Resend failure alert was removed")
 need('BACKUP_ALERT_SUBJECT: "OI backup restore-test FAILED"' in wf, "restore failure alert subject changed")
 need("OI_PROD_DATABASE_URL" not in wf, "restore workflow still receives the production database URL")
@@ -153,6 +155,8 @@ need("image: postgres:17\n" in offline, "offline test service image is not postg
 need("install-pg17-client.sh" in offline, "offline workflow does not install the PostgreSQL 17 client")
 backup = (root / ".github/workflows/oi-production-offsite-backup.yml").read_text(encoding="utf-8")
 need("install-pg17-client.sh" in backup, "backup workflow does not install the PostgreSQL 17 client")
+need('cron: "0 10 * * *"\n' in backup, "backup schedule is not nightly at 10:00 UTC")
+need("workflow_dispatch:" in backup, "backup workflow_dispatch was removed")
 need("postgresql-client " not in backup and "postgresql-client\n" not in backup, "backup workflow installs the distro client metapackage")
 if problems:
     sys.stderr.write("\n".join(problems) + "\n")
