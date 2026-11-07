@@ -1,0 +1,57 @@
+# SEC-1 offline backup tests. No production access and no GitHub secrets.
+# Runs only on sec1/offsite-backup. There is no schedule.
+name: OI offsite backup offline tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - sec1/offsite-backup
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    if: github.ref == 'refs/heads/sec1/offsite-backup'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client python3-cryptography curl ca-certificates
+          python3 -m pip install --user --break-system-packages 'awscli==1.36.40'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install MinIO
+        run: |
+          # The unversioned dl.min.io URL currently returns 410. Pin a release
+          # that still publishes a linux-amd64 binary.
+          curl -fL --retry 3 -o /tmp/minio \
+            https://github.com/minio/minio/releases/download/RELEASE.2025-09-07T16-13-09Z/minio.linux-amd64.RELEASE.2025-09-07T16-13-09Z
+          chmod +x /tmp/minio
+          /tmp/minio --version
+
+      - name: Offline backup tests
+        env:
+          SEC1_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+          SEC1_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          MINIO_BIN: /tmp/minio
+        run: bash scripts/offsite-backup/test-offline.sh
