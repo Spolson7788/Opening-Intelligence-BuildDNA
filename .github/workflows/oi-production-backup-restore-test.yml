@@ -1,16 +1,18 @@
-# SEC-1: Restore test into throwaway Postgres in CI (never production/staging).
+# SEC-1: Restore the newest oi-production R2 snapshot into throwaway Postgres 17.
+# Never production or staging. Synthetic mode is an explicit opt-in only.
 name: OI production backup restore test
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "synthetic (offline fixture) or r2 (download latest snapshot)"
+        description: "r2 (newest snapshots/YYYY-MM-DD from R2) or synthetic (explicit offline fixture only)"
+        required: false
         type: choice
         options:
-          - synthetic
           - r2
-        default: synthetic
+          - synthetic
+        default: r2
 
 permissions:
   contents: read
@@ -21,7 +23,7 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -36,31 +38,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install PostgreSQL 17 client tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-client python3-cryptography
+          bash scripts/offsite-backup/install-pg17-client.sh
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
           python3 -m pip install --user --break-system-packages 'awscli==1.36.40'
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Wait for Postgres
+      - name: Wait for Postgres 17
         run: |
+          export PATH="/usr/lib/postgresql/17/bin:${PATH}"
           for i in $(seq 1 30); do
-            pg_isready -h localhost -p 5432 -U postgres && exit 0
+            if pg_isready -h localhost -p 5432 -U postgres; then
+              break
+            fi
+            if [[ "$i" -eq 30 ]]; then
+              exit 1
+            fi
             sleep 1
           done
-          exit 1
+          version="$(psql "postgresql://postgres:postgres@localhost:5432/oi_restore_test" -v ON_ERROR_STOP=1 -tAc 'SHOW server_version_num')"
+          version="${version//[[:space:]]/}"
+          [[ "$version" =~ ^17[0-9]{4}$ ]]
+          pg_restore --version | grep -q '(PostgreSQL) 17\.'
+          pg_dump --version | grep -q '(PostgreSQL) 17\.'
 
       - name: Run restore test
         env:
-          SEC1_MODE: ${{ inputs.mode }}
+          # An omitted workflow_dispatch input is the newest real snapshot.
+          SEC1_MODE: ${{ inputs.mode || 'r2' }}
           SEC1_TARGET_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/oi_restore_test
           BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
-          OI_PROD_DATABASE_URL: ${{ secrets.OI_PROD_DATABASE_URL }}
         run: bash scripts/offsite-backup/restore-test.sh
 
       - name: Alert on failure

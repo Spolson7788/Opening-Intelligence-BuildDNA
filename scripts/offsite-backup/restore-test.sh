@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
-# SEC-1 restore test into a throwaway Postgres (CI service container).
+# SEC-1 restore test into a throwaway Postgres 17 (CI service container).
 # The target host must be localhost, 127.0.0.1, ::1, or a local socket.
 # supabase.co and every other host are refused before any connection.
+# This script never connects to the production database.
 #
 # Modes:
-#   SEC1_MODE=synthetic  — generate a tiny dump locally (default in CI without R2)
-#   SEC1_MODE=r2         — download a snapshot from the backup bucket
+#   SEC1_MODE=r2         — newest snapshots/YYYY-MM-DD from the backup bucket (default)
+#   SEC1_MODE=synthetic  — explicit opt-in: build a tiny dump locally
 set -euo pipefail
 umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-MODE="${SEC1_MODE:-synthetic}"
+# Prefer the pinned PostgreSQL 17 client over a newer distro metapackage.
+if [[ -d /usr/lib/postgresql/17/bin ]]; then
+  PATH="/usr/lib/postgresql/17/bin:${PATH}"
+  export PATH
+fi
+
+# Empty and unset both mean the real snapshot. Synthetic is opt-in only.
+MODE="${SEC1_MODE:-r2}"
 WORK="${SEC1_WORK_DIR:-$(mktemp -d /tmp/sec1-restore.XXXXXX)}"
 TARGET_DB_URL="${SEC1_TARGET_DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/oi_restore_test}"
+SNAPSHOT_PREFIX=""
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
@@ -25,9 +34,71 @@ export SEC1_TARGET_DATABASE_URL="$TARGET_DB_URL"
 require_cmd python3
 require_cmd psql
 require_cmd pg_restore
+require_cmd pg_dump
+require_cmd pg_dumpall
 require_cmd sha256sum
 require_env BACKUP_ENCRYPTION_KEY
 mkdir -p "$WORK"
+
+pg_client_major() {
+  local cmd="$1" line major
+  line="$("$cmd" --version 2>/dev/null || true)"
+  major="$(printf '%s\n' "$line" | sed -n 's/.*(PostgreSQL) \([0-9][0-9]*\)\..*/\1/p' | head -n 1)"
+  if [[ ! "$major" =~ ^[0-9]+$ ]]; then
+    die "${cmd} version is not PostgreSQL 17"
+  fi
+  printf '%s' "$major"
+}
+
+assert_postgres_17() {
+  local tool major server_num err rc
+  for tool in psql pg_restore pg_dump pg_dumpall; do
+    major="$(pg_client_major "$tool")"
+    [[ "$major" == "17" ]] || die "${tool} must be PostgreSQL 17, found major ${major}"
+  done
+  err="$WORK/server-version.err"
+  set +e
+  server_num="$(psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -tAc 'SHOW server_version_num' 2>"$err")"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    python3 "$LIB_DIR/redact.py" "$err" >&2 || true
+    die "could not read restore target server version"
+  fi
+  server_num="${server_num//[[:space:]]/}"
+  [[ "$server_num" =~ ^[0-9]+$ ]] || die "could not read restore target server version"
+  major=$((10#$server_num / 10000))
+  [[ "$major" -eq 17 ]] || die "restore target must be PostgreSQL 17, found major ${major}"
+  log "postgres client and server are major version 17"
+}
+
+assert_restored_key_tables() {
+  local tables count present t
+  tables="$(psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -tAc \
+    "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r'")" \
+    || die "could not count restored tables"
+  tables="${tables//[[:space:]]/}"
+  [[ "$tables" =~ ^[1-9][0-9]*$ ]] || die "restored database has no public tables"
+  log "restored public tables=${tables}"
+  for t in organizations users platform_staff; do
+    present="$(psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -tAc \
+      "SELECT to_regclass('public.${t}') IS NOT NULL")" \
+      || die "could not check key table public.${t}"
+    present="${present//[[:space:]]/}"
+    [[ "$present" == "t" ]] || die "key table public.${t} is missing"
+    count="$(psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -tAc \
+      "SELECT count(*) FROM public.${t}")" \
+      || die "row count failed for public.${t}"
+    count="${count//[[:space:]]/}"
+    [[ "$count" =~ ^[0-9]+$ ]] || die "row count for public.${t} is not a number"
+    if [[ "$t" == "organizations" || "$t" == "users" ]]; then
+      [[ "$count" -ge 1 ]] || die "key table public.${t} is empty after restore"
+    fi
+    log "restored public.${t} count=${count}"
+  done
+}
+
+assert_postgres_17
 
 dump_roles_to() {
   local dest="$1" err="$2" rc
@@ -55,17 +126,10 @@ if [[ "$MODE" == "r2" ]]; then
   if [[ -z "$SNAPSHOT_PREFIX" ]]; then
     listing="$(aws s3 ls "s3://${R2_BUCKET}/snapshots/" --endpoint-url "$R2_ENDPOINT")" \
       || die "cannot list snapshots"
-    SNAPSHOT_PREFIX="$(
-      printf '%s\n' "$listing" \
-        | awk '{print $NF}' \
-        | tr -d '/' \
-        | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
-        | sort \
-        | tail -1
-    )" || die "no dated snapshots found in the backup bucket"
-    [[ -n "$SNAPSHOT_PREFIX" ]] || die "no snapshots found in the backup bucket"
-    SNAPSHOT_PREFIX="snapshots/${SNAPSHOT_PREFIX}"
+    SNAPSHOT_PREFIX="$(printf '%s\n' "$listing" | python3 "$LIB_DIR/snapshot_prefix.py")" \
+      || die "no dated snapshots found in the backup bucket"
   fi
+  [[ -n "$SNAPSHOT_PREFIX" ]] || die "snapshot prefix is empty"
   log "downloading ${SNAPSHOT_PREFIX}"
   mkdir -p "$WORK/snap"
   aws s3 sync "s3://${R2_BUCKET}/${SNAPSHOT_PREFIX}" "$WORK/snap" --endpoint-url "$R2_ENDPOINT" --only-show-errors \
@@ -185,22 +249,13 @@ elif [[ "$MODE" == "synthetic" ]]; then
   NOTE="${NOTE//[[:space:]]/}"
   [[ "$NOTE" == "hello-sec1" ]] || die "row content mismatch"
   log "synthetic restore PASS (row count + content)"
-elif [[ -n "${OI_PROD_DATABASE_URL:-}" && "${SEC1_OFFLINE_TEST:-}" != "1" ]]; then
-  assert_production_only
-  for t in organizations users platform_staff; do
-    LIVE="$(psql "$OI_PROD_DATABASE_URL" -v ON_ERROR_STOP=1 -tAc "select count(*) from public.${t}")"
-    REST="$(psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -tAc "select count(*) from public.${t}")"
-    LIVE="${LIVE//[[:space:]]/}"
-    REST="${REST//[[:space:]]/}"
-    [[ "$LIVE" == "$REST" ]] || die "count mismatch for ${t} live=${LIVE} restored=${REST}"
-    log "restored public.${t} count=${REST}"
-  done
-  log "r2 restore PASS (organizations/users/platform_staff counts match live)"
 else
-  for t in organizations users platform_staff; do
-    COUNT="$(psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -tAc "select count(*) from public.${t}")"
-    log "restored public.${t} count=${COUNT//[[:space:]]/}"
-  done
+  assert_restored_key_tables
+  log "r2 restore PASS (key tables present)"
 fi
 
-log "restore-test PASS mode=${MODE}"
+if [[ "$MODE" == "r2" ]]; then
+  log "restore-test PASS mode=r2 snapshot=${SNAPSHOT_PREFIX}"
+else
+  log "restore-test PASS mode=${MODE}"
+fi

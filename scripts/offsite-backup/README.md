@@ -26,7 +26,7 @@ Never commit values. Never point these at other Supabase projects. Do not set `S
 
 `snapshots/YYYY-MM-DD/` (America/Phoenix) and, on the 1st or when forced, `monthly/YYYY-MM-01/`:
 
-- `db/oi-production.dump.enc` — custom-format `pg_dump` (`--no-owner --no-acl`), AES-256-GCM
+- `db/oi-production.dump.enc` — custom-format `pg_dump` 17 (`--no-owner --no-acl`), AES-256-GCM
 - `db/oi-production.roles.sql.enc` — `pg_dumpall --roles-only` (roles and membership GRANTs, including password hashes), AES-256-GCM
 - `db/*.plaintext.sha256` — hash of the plaintext, so a decrypt can be checked
 - `storage/` — objects from bucket `oi-production-media`, every nested folder and every list page
@@ -57,10 +57,14 @@ Format details and the restore host rules are in `docs/ops/SEC1-OFFSITE-BACKUP.m
 
 Use `restore-test.sh`. It refuses every database host except `localhost`, `127.0.0.1`, `::1`, and a local unix socket. `supabase.co` and any other host, including a `?host=` or `?hostaddr=` override, are refused before `psql` runs.
 
+The throwaway server and the client tools (`psql`, `pg_dump`, `pg_restore`, `pg_dumpall`) must both be PostgreSQL 17. A pg_dump 17 archive sets `transaction_timeout`, which older servers reject. `install-pg17-client.sh` installs that client. The script refuses to restore unless the client and the server both report major version 17.
+
+With `SEC1_MODE` unset or empty, the script downloads the newest `snapshots/YYYY-MM-DD/` prefix. `SEC1_MODE=synthetic` is an explicit opt-in that builds a tiny local dump instead.
+
 ```bash
 export BACKUP_ENCRYPTION_KEY
 export SEC1_TARGET_DATABASE_URL='postgresql://postgres@127.0.0.1:5432/oi_restore_test'
-export SEC1_MODE=r2
+# SEC1_MODE defaults to r2. Set SEC1_MODE=synthetic only for the offline fixture.
 export SEC1_SNAPSHOT_PREFIX=snapshots/YYYY-MM-DD   # optional; default is the newest daily snapshot
 bash scripts/offsite-backup/restore-test.sh
 ```
@@ -70,7 +74,7 @@ The throwaway server's own bootstrap role (usually `postgres`) is left unchanged
 ## Workflows
 
 - `oi-production-offsite-backup.yml` — `workflow_dispatch` only (cron commented out).
-- `oi-production-backup-restore-test.yml` — `workflow_dispatch`; modes `synthetic` or `r2`.
+- `oi-production-backup-restore-test.yml` — `workflow_dispatch`. The default, including a dispatch with no inputs, restores the newest `snapshots/YYYY-MM-DD/` object from R2 into Postgres 17. `synthetic` is an explicit input only.
 - `oi-offsite-backup-offline-test.yml` — push to `sec1/offsite-backup` and `workflow_dispatch`. No secrets and no cron. Runs `test-offline.sh`.
 
 ## Offline test
